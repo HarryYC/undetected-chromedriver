@@ -19,8 +19,11 @@ by UltrafunkAmsterdam (https://github.com/ultrafunkamsterdam)
 import io
 import logging
 import os
+import re
 import sys
 import zipfile
+import string
+import random
 from distutils.version import LooseVersion
 from urllib.request import urlopen, urlretrieve
 
@@ -30,12 +33,11 @@ from selenium.webdriver import ChromeOptions as _ChromeOptions
 logger = logging.getLogger(__name__)
 
 
-__IS_PATCHED__ = 0
 TARGET_VERSION = 0
 
 
 class Chrome:
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, *args, emulate_touch=False, **kwargs):
 
         if not ChromeDriverManager.installed:
             ChromeDriverManager(*args, **kwargs).install()
@@ -49,31 +51,55 @@ class Chrome:
             kwargs["options"] = ChromeOptions()
         instance = object.__new__(_Chrome)
         instance.__init__(*args, **kwargs)
-        instance.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {
-                "source": """
-        Object.defineProperty(window, 'navigator', {
-            value: new Proxy(navigator, {
-              has: (target, key) => (key === 'webdriver' ? false : key in target),
-              get: (target, key) =>
-                key === 'webdriver'
-                  ? undefined
-                  : typeof target[key] === 'function'
-                  ? target[key].bind(target)
-                  : target[key]
-            })
-        })
-                  """
-            },
-        )
+
+        instance._orig_get = instance.get
+
+        def _get_wrapped(*args, **kwargs):
+            if instance.execute_script("return navigator.webdriver"):
+                instance.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": """
+
+                                   Object.defineProperty(window, 'navigator', {
+                                       value: new Proxy(navigator, {
+                                       has: (target, key) => (key === 'webdriver' ? false : key in target),
+                                       get: (target, key) =>
+                                           key === 'webdriver'
+                                           ? undefined
+                                           : typeof target[key] === 'function'
+                                           ? target[key].bind(target)
+                                           : target[key]
+                                       })
+                                   });
+                               """
+                    },
+                )
+            return instance._orig_get(*args, **kwargs)
+
+        instance.get = _get_wrapped
+        instance.get = _get_wrapped
+        instance.get = _get_wrapped
+
         original_user_agent_string = instance.execute_script(
             "return navigator.userAgent"
         )
         instance.execute_cdp_cmd(
             "Network.setUserAgentOverride",
-            {"userAgent": original_user_agent_string.replace("Headless", ""),},
+            {
+                "userAgent": original_user_agent_string.replace("Headless", ""),
+            },
         )
+        if emulate_touch:
+            instance.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": """
+                                   Object.defineProperty(navigator, 'maxTouchPoints', {
+                                       get: () => 1
+                               })"""
+                },
+            )
         logger.info(f"starting undetected_chromedriver.Chrome({args}, {kwargs})")
         return instance
 
@@ -89,8 +115,7 @@ class ChromeOptions:
         instance.__init__()
         instance.add_argument("start-maximized")
         instance.add_experimental_option("excludeSwitches", ["enable-automation"])
-        instance.add_experimental_option("useAutomationExtension", False)
-        logger.info(f"starting undetected_chromedriver.ChromeOptions({args}, {kwargs})")
+        instance.add_argument("--disable-blink-features=AutomationControlled")
         return instance
 
 
@@ -106,12 +131,16 @@ class ChromeDriverManager(object):
 
         _platform = sys.platform
 
-        if TARGET_VERSION:  # user override using global
+        if TARGET_VERSION:
+            # use global if set
             self.target_version = TARGET_VERSION
+
         if target_version:
+            # use explicitly passed target
             self.target_version = target_version  # user override
+
         if not self.target_version:
-            # if target_version still not set, fetch the current major release version
+            # none of the above (default) and just get current version
             self.target_version = self.get_release_version_number().version[
                 0
             ]  # only major version int
@@ -142,7 +171,7 @@ class ChromeDriverManager(object):
 
         selenium.webdriver.Chrome = Chrome
         selenium.webdriver.ChromeOptions = ChromeOptions
-        logger.warning("Selenium patched. Safe to import Chrome / ChromeOptions")
+        logger.info("Selenium patched. Safe to import Chrome / ChromeOptions")
         self_.__class__.selenium_patched = True
 
     def install(self, patch_selenium=True):
@@ -159,8 +188,9 @@ class ChromeDriverManager(object):
         """
         if not os.path.exists(self.executable_path):
             self.fetch_chromedriver()
-            self.patch_binary()
-            self.__class__.installed = True
+            if not self.__class__.installed:
+                if self.patch_binary():
+                    self.__class__.installed = True
 
         if patch_selenium:
             self.patch_selenium_webdriver()
@@ -200,26 +230,30 @@ class ChromeDriverManager(object):
             os.chmod(self._exe_name, 0o755)
         return self._exe_name
 
+    @staticmethod
+    def random_cdc():
+        cdc = random.choices(string.ascii_lowercase, k=26)
+        cdc[-6:-4] = map(str.upper, cdc[-6:-4])
+        cdc[2] = cdc[0]
+        cdc[3] = "_"
+        return "".join(cdc).encode()
+
     def patch_binary(self):
         """
         Patches the ChromeDriver binary
 
         :return: False on failure, binary name on success
         """
-        if self.__class__.installed:
-            return
-
-        with io.open(self.executable_path, "r+b") as binary:
-            for line in iter(lambda: binary.readline(), b""):
+        linect = 0
+        replacement = self.random_cdc()
+        with io.open(self.executable_path, "r+b") as fh:
+            for line in iter(lambda: fh.readline(), b""):
                 if b"cdc_" in line:
-                    binary.seek(-len(line), 1)
-                    line = b"  var key = '$azc_abcdefghijklmnopQRstuv_';\n"
-                    binary.write(line)
-                    __IS_PATCHED__ = 1
-                    break
-            else:
-                return False
-            return True
+                    fh.seek(-len(line), 1)
+                    newline = re.sub(b"cdc_.{22}", replacement, line)
+                    fh.write(newline)
+                    linect += 1
+            return linect
 
 
 def install(executable_path=None, target_version=None, *args, **kwargs):
